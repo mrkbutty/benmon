@@ -1,0 +1,56 @@
+# my global config
+global:
+  scrape_interval: 15s # Set the scrape interval to every 15 seconds. Default is every 1 minute.
+  evaluation_interval: 15s # Evaluate rules every 15 seconds. The default is every 1 minute.
+  # scrape_timeout is set to the global default (10s).
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          # - alertmanager:9093
+
+# Load rules once and periodically evaluate them according to the global 'evaluation_interval'.
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+# A scrape configuration containing exactly one endpoint to scrape:
+# Here it's Prometheus itself.
+scrape_configs:
+  # The job name is added as a label `job=<job_name>` to any timeseries scraped from this config.
+  - job_name: "prometheus"
+
+    # metrics_path defaults to '/metrics'
+    # scheme defaults to 'http'.
+
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Example job for node_exporter
+  - job_name: 'prime19'
+    static_configs:
+      - targets: ['prime19:9100']
+
+  - job_name: 'vdbench'
+    static_configs:
+      - targets: ['prime19:8113']
+
+  - job_name: 'loadgens'
+    static_configs:
+      - targets: ['hlg201:9100', 'hlg202:9100', 'hlg203:9100', 'hlg204:9100']
+  #- job_name: 'hlg202'
+    #static_configs:
+      #- targets: ['hlg202:9100']
+  #- job_name: 'hlg203'
+    #static_configs:
+      #- targets: ['hlg203:9100']
+  #- job_name: 'hlg204'
+    #static_configs:
+      #- targets: ['hlg204:9100']
+
+  # Example job for cadvisor
+  # - job_name: 'cadvisor'
+  #   static_configs:
+  #     - targets: ['cadvisor:8080']

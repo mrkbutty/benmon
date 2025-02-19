@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Author: Mark (Butty) Butterworth
+# Setup and control of "benmon" environment for benchmark monitoring 
+# create a function under a function_help description to auto add to menu
+
+
+_run_graphite() {
+    podman run --pod benmon --name graphite -d \
+        -v ./graphite_config:/opt/graphite/conf:ro \
+        -v graphite_data://opt/graphite/storage \
+        graphiteapp/graphite-statsd
+}
+
+
+_run_prometheus() {
+    podman run --pod benmon --name prometheus -d \
+        -v ./prometheus.yml:/etc/prometheus/prometheus.yml:ro \
+        -v prometheus_data:/prometheus \
+        prom/prometheus
+}
+
+
+_run_grafana() {
+    podman run --pod benmon --name grafana -d \
+        -v grafana_data:/var/lib/grafana:Z \
+        docker.io/grafana/grafana-oss
+}
+
+
+create_pod_help="Create the podman pod for benchmark monitoring"
+create_pod(){
+    # Create pod and set ports:
+    podman pod create --replace -p 3000:3000,9091:9090,80:80,2003-2004:2003-2004,2023-2024:2023-2024,8125:8125/udp,8126:8126 benmon
+
+    # Delete and recreate volumes
+    for vol in grafana_data prometheus_data graphite_data; do
+        podman volume exists $vol && \
+            read -p "Delete Vol: $vol ? " -n 1 -r && [[ $REPLY =~ ^[[Yy]$ ]] && \
+            podman volume rm $vol
+        podman volume exists $vol || podman volume create $vol
+        echo ""
+    done
+
+    # Start containers:
+    _run_grafana
+    _run_prometheus
+    _run_graphite
+    sleep 1
+    podman pod ls
+    echo "TCP Ports: Grapfana=3000   Prometheus=9091   Graphite=80"
+
+    echo ""
+    echo "Some services may need an ssh tunnel to connect through the firewall"
+    echo "Windows example: C:\\Users\\username\\ssh\\config:"
+    echo "    Host prime19"
+    echo "        Hostname 172.23.102.198"
+    echo "        User root"
+    echo "        LocalForward 9091 127.0.0.1:9091"
+}
+
+clear_graphite_help="Clear the graphite data"
+clear_graphite() {
+    vol=graphite_data
+    podman stop graphite
+    podman rm graphite
+    podman volume exists $vol && podman volume rm $vol
+    podman volume exists $vol || podman volume create $vol
+    _run_graphite
+}
+
+
+setup_portainer_help="Create a portainer container to manage podman via web:9443"
+setup_portainer() {
+    vol=portainer_data
+    podman volume exists $vol && \
+        read -p "Delete Vol: $vol ? " -n 1 -r && [[ $REPLY =~ ^[[Yy]$ ]] && \
+        podman volume rm $vol
+    podman volume exists $vol || podman volume create $vol
+
+    systemctl enable --now podman.socket
+
+    podman run -d --name portainer \
+        -p 8000:8000 -p 9443:9443  \
+        --restart=always --privileged \
+        -v /run/podman/podman.sock:/var/run/docker.sock -v portainer_data:/data \
+        portainer/portainer-ce:latest
+    echo "Portainer should be available on TCP port 9443"
+}
+
+
+usage() {
+    echo "BenMon setup tools"
+    echo "------------------"
+    echo "Usage: $(basename $0) <command> <args>..."
+    echo ""
+    declare -F | awk '{print $3}' | while read -r funname; do
+        help=${funname}_help
+        [[ -n ${!help} ]] && echo -e "  ${funname}\t- ${!help}"
+    done
+    echo ""
+    podman pod ls
+    echo ""
+    return 0
+}
+
+
+[[ $# -lt 1 ]] && usage && exit
+command=${1}
+shift
+if declare -F | egrep "^declare -f ${command}$" > /dev/null; then
+    ${command} "$@" # preserves quoting
+else
+    echo ERROR: command not found: $command
+fi
