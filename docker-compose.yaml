@@ -1,7 +1,22 @@
 services:
   grafana:
-    image: grafana/grafana-enterprise
+    image: docker.io/grafana/grafana-oss
     container_name: grafana
     restart: unless-stopped
     ports:
      - '3000:3000'
+    volumes:
+      - grafana_data:/var/lib/grafana
+  prometheus:
+    image: prom/prometheus
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+     - '9091:9090'  # RHEL has cockpit on 9090
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+
+volumes:
+  grafana_data: {}
+  prometheus_data: {}

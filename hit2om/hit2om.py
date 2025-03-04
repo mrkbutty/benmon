@@ -1,10 +1,10 @@
 #! /usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Monitor Vdbench and make available for prometheus to scrape
+Convert export data to open metrics for backfilling with promtool into prometheus
 """
 __author__  = "Mark Butterworth"
-__version__ = "0.1.0 20250218"
+__version__ = "0.1.0 20250103"
 __license__ = "MIT"
 
 # Ver 0.1.0 20250217  Initial version
@@ -32,19 +32,14 @@ __license__ = "MIT"
 # SOFTWARE.
 
 import sys
-import os
 import argparse
 import psutil
 import time
-import signal
-
 from typing import Tuple, Optional, Union, TextIO
 from pathlib import Path
 from datetime import datetime
 from socket import gethostname
 
-import prometheus_client
-from prometheus_client import REGISTRY, start_http_server, CollectorRegistry, Gauge
 
 DEBUG = 0
 VERBOSE = 0
@@ -72,22 +67,11 @@ EXPORTER_PORT = 8113
 #         return metrics
 
 
-
-def sigterm_handler(signo, stack_frame):
-    print(f'{signal.strsignal(signo)} received, Exiting...')
-    # Raises SystemExit(0):
-    sys.exit(0)
-
-signal.signal(signal.SIGTERM, sigterm_handler)
-signal.signal(signal.SIGINT, sigterm_handler)
-
-
-def find_vdb_flatfile() -> Tuple[int, Union[Path, None]]:
+def active_vdb_flatfile() -> Tuple[int, Union[Path, None]]:
     firstvdb = None
     for proc in psutil.process_iter():
         outputarg = 0
         try:
-            if DEBUG >= 2: print(f'proc.cmdline={proc.cmdline()}')
             for i, arg in enumerate(proc.cmdline()):
                 if arg.endswith('vdbench.jar'):
                     firstvdb = proc
@@ -99,25 +83,24 @@ def find_vdb_flatfile() -> Tuple[int, Union[Path, None]]:
             pass   # Continue with next process
 
     if firstvdb:
-        # workdir = Path(firstvdb.cwd())
+        workdir = Path(firstvdb.cwd())
         if outputarg > 0 and outputarg < len(firstvdb.cmdline()):
             workdir = Path(firstvdb.cmdline()[outputarg])
             flatfile = workdir / 'flatfile.html'
             if flatfile.is_file and flatfile.exists() and flatfile.stat().st_size > 0:
                 return firstvdb.pid, flatfile
-
         return firstvdb.pid, None
-    return None, None
+    return -1, None
 
 
 def vdb_alive(pid: int) -> bool:
     try:
         proc = psutil.Process(pid)
-        for arg in proc.cmdline():
-            if arg.endswith('vdbench.jar'):
-                return True
     except (psutil.NoSuchProcess, psutil.ZombieProcess):
         return False
+    for arg in proc.cmdline():
+        if arg.endswith('vdbench.jar'):
+            return True
     return False
 
 
@@ -177,7 +160,7 @@ def process_flatfile(pid: int, flatfile: str, labels: Optional[dict]=None):
             # timestamp = datetime.strptime(logtime, DATETIME_FORMAT).timestamp()
             run = values[2]
             if run != lastrun:
-                print(f'\n{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} Scraping run: {run} ...')
+                print(f'\n{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} Monitoring run: {run} ', end='')
                 for k in gauges:
                     gauges[k].clear()
                 lastrun = run
@@ -203,18 +186,14 @@ def vdb_proc_monitor():
 
     while True:
         if toggle:
-            print('\nLooking for a Vdbench process with output option (-o).')
-            print('(Ensure the host /proc & Vdbench output directories are exposed to the docker container)')
-            print('Monitoring for Vdbench process ...')
+            print('Monitoring for Vdbench process with active flatfile...')
             toggle = not toggle
-        vdb_pid, vdb_flatfile = find_vdb_flatfile()
+        vdb_pid, vdb_flatfile = active_vdb_flatfile()
         if vdb_pid and vdb_flatfile:
             toggle = not toggle
-            hostname = os.environ.get('VDB_EXPORTER_HOSTNAME', gethostname())
-            labels = { 'hostname': hostname, 'resultdir': vdb_flatfile.parent.name }
+            labels = { 'hostname': gethostname(), 'resultdir': vdb_flatfile.parent.name }
             print(f'Vdbench is active on PID: {vdb_pid} {labels}')
             process_flatfile(vdb_pid, vdb_flatfile, labels)
-
         time.sleep(0.25)
 
 def cli():

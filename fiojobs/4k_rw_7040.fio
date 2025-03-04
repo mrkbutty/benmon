@@ -1,0 +1,48 @@
+# 4K random read/write 70/40%
+
+[global]
+# The numjobs starts a thread for each job:
+numjobs=48
+# Note: iodepth is across jobs, so if a job has multiple devices/files they share the iodepth as a total.
+# To set iodepth per device/file put each filename in a seperate job.
+iodepth=128
+
+# Runtime:
+time_based=1
+ramp_time=60
+runtime=180
+
+# Options:
+direct=1
+overwrite=1
+ioengine=posixaio
+group_reporting=1
+# Turn off latency and disk stats:
+disable_clat=1
+disable_slat=1
+slat_percentiles=0
+clat_percentiles=0
+disk_util=0
+
+
+# Compression & Dedupe:
+buffer_compress_percentage=50
+# Refill the buffers on every submit:
+refill_buffers=1
+# Without buffer_pattern the compressible pattern is nulls:
+buffer_pattern=0xdeadbeef
+dedupe_percentage=50
+
+
+[4K RWmix7030]
+# IO profile
+# Sequential: rw=read,write,trim,rw,readwrite,trimwrite
+# Random: rw=randread,randwrite,randtrim,randrw,randtrimwrite
+rw=randrw
+rwmixread=70
+#percentage_random=70
+bs=4k
+# The rate_iops (reads,writes,trims) will override any rwmix settings
+# rate_iops=700,300
+filename=/dev/sdc:/dev/sdd
+# size=1m

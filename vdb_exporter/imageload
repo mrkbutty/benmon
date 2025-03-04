@@ -1,0 +1,2 @@
+docker image load --input vdb_exporter.docker.image
+

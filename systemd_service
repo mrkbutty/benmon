@@ -1,0 +1,42 @@
+# Old example of creating a systemd config, Instead see: "podman generate systemd"
+Description=Podman BenMon
+Documentation=man:podman-run(1)
+Documentation=https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html/building_running_and_managing_containers/assembly_porting-containers-to-systemd-using-podman_building-running-and-managing-containers
+RequiresMountsFor=%t/containers
+
+[Service]
+Environment=PODMAN_SYSTEMD_UNIT=%n
+ExecStartPre=-/usr/bin/podman rm -f --ignore --cidfile=%t/%n.ctr-id
+ExecStartPre=-/bin/rm -f %t/%n.ctr-id
+ExecStartPre=-/bin/rm -f %t/%n.pid
+ExecStartPre=mkdir -p %E/%N/
+ExecStart=/usr/bin/podman run \
+    --name %N \
+    -d \
+    --cidfile=%t/%n.ctr-id --sdnotify=conmon --cgroups=no-conmon \
+    --conmon-pidfile=%t/%n.pid \
+    --replace \
+    --log-driver=journald \
+    --network slirp4netns:allow_host_loopback=true,enable_ipv6=true \
+    --restart no \
+    --rm \
+    --env TZ=America/Chicago \
+    --env PUID=0 \
+    --env PGID=0 \
+    -p 8015:3030/tcp \
+    -v /etc/localtime:/etc/localtime:ro \
+    -v %E/%N/:/config:rw \
+    -l diun.enable=true \
+    docker.io/cloudb0x/autoscan:latest
+ExecReload=-/usr/bin/podman stop --ignore --cidfile=%t/%n.ctr-id
+ExecReload=-/usr/bin/podman rm -f --ignore --cidfile=%t/%n.ctr-id
+ExecStop=/usr/bin/podman stop --ignore --cidfile=%t/%n.ctr-id
+ExecStopPost=/usr/bin/podman rm -f --ignore --cidfile=%t/%n.ctr-id
+Type=notify
+NotifyAccess=all
+PIDFile=%t/%n.pid
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+WantedBy=default.target

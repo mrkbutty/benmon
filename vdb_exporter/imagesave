@@ -1,0 +1,2 @@
+podman image save vdb_exporter -o vdb_exporter.docker.image
+

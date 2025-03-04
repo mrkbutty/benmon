@@ -1,0 +1,2 @@
+podman image save vdb_exporter -o hitmp_exporter.docker.image
+

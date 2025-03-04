@@ -3,20 +3,42 @@
 # Setup and control of "benmon" environment for benchmark monitoring 
 # create a function under a function_help description to auto add to menu
 
+SCRIPT=$(realpath "${BASH_SOURCE[0]}")
+SCRIPTPATH=$(dirname "$SCRIPT")
 
-_run_graphite() {
-    podman run --pod benmon --name graphite -d \
-        -v ./graphite_config:/opt/graphite/conf:ro \
-        -v graphite_data://opt/graphite/storage \
-        graphiteapp/graphite-statsd
+[[ -z $FIOPROG ]] && FIOPROG=$(realpath $SCRIPTPATH/fio-3.38/fio)
+FIOVER=$($FIOPROG --version)
+
+
+_run_loki() {
+    podman run --pod benmon --name loki -d \
+        -v ./loki-config.yaml:/etc/loki/local-config.yaml \
+        -v loki_data:/loki \
+        docker.io/grafana/loki -config.file=/etc/loki/local-config.yaml
 }
+
+
+_run_promtail() {
+    podman run --pod benmon --name promtail -d \
+        -v ./promtail-config.yaml:/etc/promtail-config.yaml \
+        -v /var/log:/var/log:ro \
+        docker.io/grafana/promtail -config.file=/etc/promtail-config.yaml
+}
+
+
+# _run_graphite() {
+#     podman run --pod benmon --name graphite -d \
+#         -v ./graphite_config:/opt/graphite/conf:ro \
+#         -v graphite_data://opt/graphite/storage \
+#         docker.io/graphiteapp/graphite-statsd
+# }
 
 
 _run_prometheus() {
     podman run --pod benmon --name prometheus -d \
         -v ./prometheus.yml:/etc/prometheus/prometheus.yml:ro \
         -v prometheus_data:/prometheus \
-        prom/prometheus
+        docker.io/prom/prometheus
 }
 
 
@@ -26,14 +48,21 @@ _run_grafana() {
         docker.io/grafana/grafana-oss
 }
 
+_run_vdb_exporter() {
+    podman run --pod benmon --name vdb_exporter -d \
+    -v /proc:/proc:ro \
+    -v /results:/results:ro \
+    vdb_exporter
+}
 
 create_pod_help="Create the podman pod for benchmark monitoring"
 create_pod(){
     # Create pod and set ports:
-    podman pod create --replace -p 3000:3000,9091:9090,80:80,2003-2004:2003-2004,2023-2024:2023-2024,8125:8125/udp,8126:8126 benmon
+    # podman pod create --replace -p 3000:3000,3100:3100,9091:9090,80:80,2003-2004:2003-2004,2023-2024:2023-2024,8125:8125/udp,8126:8126 benmon
+    podman pod create --replace -p 3000:3000,3100:3100,8113:8113,9091:9090 benmon
 
     # Delete and recreate volumes
-    for vol in grafana_data prometheus_data graphite_data; do
+    for vol in grafana_data prometheus_data loki_data; do
         podman volume exists $vol && \
             read -p "Delete Vol: $vol ? " -n 1 -r && [[ $REPLY =~ ^[[Yy]$ ]] && \
             podman volume rm $vol
@@ -44,7 +73,10 @@ create_pod(){
     # Start containers:
     _run_grafana
     _run_prometheus
-    _run_graphite
+    # _run_graphite
+    _run_loki
+    _run_promtail
+    _run_vdb_exporter
     sleep 1
     podman pod ls
     echo "TCP Ports: Grapfana=3000   Prometheus=9091   Graphite=80"
@@ -58,7 +90,7 @@ create_pod(){
     echo "        LocalForward 9091 127.0.0.1:9091"
 }
 
-clear_graphite_help="Clear the graphite data"
+clear_graphite_help="Clear the Graphite data"
 clear_graphite() {
     vol=graphite_data
     podman stop graphite
@@ -66,6 +98,22 @@ clear_graphite() {
     podman volume exists $vol && podman volume rm $vol
     podman volume exists $vol || podman volume create $vol
     _run_graphite
+}
+
+clear_prom_help="Clear the Prometheus data"
+clear_prom() {
+    vol=prometheus_data
+    podman stop prometheus
+    podman rm prometheus
+    podman volume exists $vol && podman volume rm $vol
+    podman volume exists $vol || podman volume create $vol
+    _run_prometheus
+}
+
+
+systemd_help="Create a systemd configf to manage the BenMon service"
+systemd() {
+    podman generate systemd --name benmon
 }
 
 
@@ -85,6 +133,110 @@ setup_portainer() {
         -v /run/podman/podman.sock:/var/run/docker.sock -v portainer_data:/data \
         portainer/portainer-ce:latest
     echo "Portainer should be available on TCP port 9443"
+}
+
+
+setup_node_exporter_help="Run node exporter locally and on \$LGS"
+setup_node_exporter() {
+    nepath=$(which node_exporter-*/node_exporter)
+    [[ -z $nepath ]] && echo "ERROR: Cannot find node_exporter executable" && exit 1
+    nepath=$(realpath $nepath)
+
+    nepid=$(pidof node_exporter)
+    [[ -n $nepid ]] && echo "WARNING: killing local Node Exporter PID(s) $nepid" && pkill node_exporter
+    echo "localhost running: $nepath"
+    timestamp=$(date -u +%Y%m%d_%H%M%S)
+    cd /tmp
+    nohup $nepath & 2>&1 > /tmp/node_exporter_$timestamp.log < /dev/null
+
+    for lg in $LGS; do
+        nepid=$(ssh -o StrictHostKeyChecking=no $lg 'pidof node_exporter')
+        [[ -n $nepid ]] && echo "WARNING: killing fio PID(s) $nepid on LG: $lg" && ssh -o StrictHostKeyChecking=no $lg pkill node_exporter
+        scp $nepath $lg:/tmp
+        echo "$lg running: /tmp/nodeexporter"
+        timestamp=$(date -u +%Y%m%d_%H%M%S)
+        ssh $lg 'bash -c "( ( cd /tmp && nohup /tmp/node_exporter 2>&1 > /tmp/node_exporter_'$timestamp'.log < /dev/null & ) )"'
+    done
+}
+
+
+runfiomaster_help="Run fio in master mode for <job_file>... using \$LGS clients, optionally set: \$LOOP1=2,4,8,... \$LOOP2=32,64,128,..."
+runfiomaster() {
+    [[ -z $RESULTROOT ]] && RESULTROOT=/tmp/fio_results
+    [[ -z $FIOWAIT ]] && FIOWAIT=1
+
+    [[ ! -x $FIOPROG ]] && { echo "ERROR: requires the fio utility: fio not found"; exit 1; }
+    [[ -z $LGS ]] && echo "ERROR: \$LGS needs to be set to a list of Load Generator client hosts with passwordless ssh access" && exit 1
+    [[ -n $LOOP1 ]] && [[ -z $SET1 ]] && { echo "ERROR: \$LOOP1 is set without \$SET1"; exit 1; }
+    [[ -n $LOOP2 ]] && [[ -z $SET2 ]] && { echo "ERROR: \$LOOP2 is set without \$SET2"; exit 1; }
+
+    echo "Running fio in server mode on clients:"
+    # Start the fio in server mode and discove the Hitachi Storage Devices...
+    for lg in $LGS; do
+        devlist=$(ssh $lg lsscsi | awk '/OPEN-V/{print $6}')
+        nvmlist=$(ssh $lg lsblk -o NAME,SERIAL,WWN,MODEL | awk '/nvme.*HITACHI/{print "/dev/"$1}' | sort -V)
+        filenames[$lg]=$(echo $devlist $nvmlist | sed 's/ /:/g')
+        echo "$lg: Hitachi Storage Device List: ${filenames[$lg]}"
+        
+        fiopid=$(ssh -o StrictHostKeyChecking=no $lg 'pidof fio')
+        [[ -n $fiopid ]] && echo "WARNING: killing fio PID(s) $fiopid on LG: $lg" && ssh -o StrictHostKeyChecking=no $lg pkill fio
+        cmd="scp $FIOPROG $lg:/tmp/fio"
+        echo $cmd
+        $cmd
+        timestamp=$(date -u +%Y%m%d_%H%M%S)
+        clientlog=/tmp/fioclient.$lg.$timestamp.log
+        echo "RUNNING SERVER: $lg: fio server outputing to: $clientlog"
+        ssh -o StrictHostKeyChecking=no $lg /tmp/fio --server > $clientlog 2>&1 < /dev/null &
+    done
+
+    mkdir -p $RESULTROOT
+    echo "Waiting 5 seconds for startup..."
+    sleep 5
+    echo ""
+
+    while [[ -n $1 ]]; do
+        jobfile=$1
+        shift
+        [[ ! -f $jobfile ]] && { echo "ERROR: fio job file not found: $jobfile"; exit 1; }
+        echo -e "Starting job file: $jobfile\n"
+        
+        [[ -n $LOOP1 ]] && loop1_vals=${LOOP1//,/ }
+        while # Run at least once until last condition is true
+            read -r next_val1 loop1_vals <<< $loop1_vals
+            [[ -n $LOOP2 ]] && loop2_vals=${LOOP2//,/ }
+            while # Run at least once until last condition is true
+                read -r next_val2 loop2_vals <<< $loop2_vals
+
+                # Build the job files from original adding devices, numjobs and iodepth:
+                clientopt=""
+                for lg in $LGS; do
+                    sed "s%^filename=.*%filename=${filenames[$lg]}%" $jobfile  > /tmp/$(basename $jobfile).$lg
+                    clientopt+=" --client=$lg /tmp/$(basename $jobfile).$lg"
+                    [[ -n $next_val1 ]] && sed -i "s%^$SET1=.*%$SET1=$next_val1%" /tmp/$(basename $jobfile).$lg
+                    [[ -n $next_val2 ]] && sed -i "s%^$SET2=.*%$SET2=$next_val2%" /tmp/$(basename $jobfile).$lg
+                done
+                [[ -n $next_val1 ]] && echo "Custom \$LOOP1: $SET1 = $next_val1"
+                [[ -n $next_val2 ]] && echo "Custom \$LOOP2: $SET2 = $next_val2"
+
+                timestamp=$(date -u +%Y%m%d_%H%M%S)   # get the UTC timestamp
+                outputlog=$RESULTROOT/$(basename ${jobfile:?})
+                [[ -n $next_val1 ]] && outputlog+="_${SET1}${next_val1}"
+                [[ -n $next_val2 ]] && outputlog+="_${SET2}${next_val2}"
+                outputlog+=_$timestamp.log
+                echo "RUNNING CLIENT: fio output log = ${outputlog:?}"
+                jobname=$(basename $jobfile)
+                cmd="$FIOPROG $FIOPARAMS --eta=always --eta-interval=5s --output=${outputlog:?} $clientopt"
+                echo "$cmd"
+                echo "..."
+                $cmd
+                rc=$?
+                awk '/All clients/{p=1}p' ${outputlog:?}
+                echo -e "\nfio RC=$rc"
+                echo "Detailed Results output: ${outputlog:?}"
+                [[ -n "$1$loop2_vals$loop1_vals" ]] && echo -e "\n$(date +%T): Waiting \$FIOWAIT=$FIOWAIT seconds ..." && sleep $FIOWAIT && echo -e "\n\n"
+            [[ -n $loop2_vals ]]; do true; done
+        [[ -n $loop1_vals ]]; do true; done
+    done
 }
 
 

@@ -1,0 +1,1 @@
+podman run --name hitmp_exporter -d --rm -p 8213:8213 -v /HORCM:/HORCM:ro hitmp_exporter
