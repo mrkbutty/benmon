@@ -37,6 +37,10 @@ scrape_configs:
     static_configs:
       - targets: ['prime19:8113']
 
+  - job_name: 'hitmp'
+    static_configs:
+      - targets: ['prime19:8213']
+
   - job_name: 'loadgens'
     static_configs:
       - targets: ['hlg201:9100', 'hlg202:9100', 'hlg203:9100', 'hlg204:9100']

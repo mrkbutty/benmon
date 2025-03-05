@@ -1,10 +1,10 @@
 #! /usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Monitor Vdbench and make available for prometheus to scrape
+Monitor Hitachi RAID Manager "raidcfg" to gather elapsed and processing used counters
 """
 __author__  = "Mark Butterworth"
-__version__ = "0.1.0 20250218"
+__version__ = "0.1.0 20250304"
 __license__ = "MIT"
 
 # Ver 0.1.0 20250217  Initial version
@@ -37,11 +37,13 @@ import argparse
 import psutil
 import time
 import signal
+import subprocess
 
-from typing import Tuple, Optional, Union, TextIO
+from typing import Tuple, Optional, Union, TextIO, Dict
 from pathlib import Path
 from datetime import datetime
 from socket import gethostname
+from shutil import which
 
 import prometheus_client
 from prometheus_client import REGISTRY, start_http_server, CollectorRegistry, Gauge
@@ -50,9 +52,27 @@ DEBUG = 0
 VERBOSE = 0
 FORCE = False
 
-METRIC_PREFIX='vdbench_'
+METRIC_PREFIX='hitmp_'
 # DATETIME_FORMAT = r'%m/%d/%Y %H:%M:%S.%f'
-EXPORTER_PORT = 8113
+EXPORTER_PORT = 8213
+HITMP_RMLOCATION = '/HORCM'
+RAIDCFG = ''
+RAIDCOM = ''
+
+HEADER_MATCH = 'MP#'
+HEADER_TRANSLATE = {
+    'MP#': 'MPid',
+    'E-Time(us)': 'Elapsed_Time',
+    'B-Time(us)': 'Busy_Time',
+    'OT(us)': 'Open_Target_Time',
+    'OI(us)': 'Open_Initiator_Time',
+    'OE(us)': 'Open_Externmal_Time',
+    'MT(us)': 'Mainframe_Target_Time',
+    'ME(us)': 'Mainframe_External_Time',
+    'BE(us)': 'Backend_Time',
+    'Sys(us)': 'System_Time',
+}
+
 
 ###############################################################################
 
@@ -82,140 +102,118 @@ signal.signal(signal.SIGTERM, sigterm_handler)
 signal.signal(signal.SIGINT, sigterm_handler)
 
 
-def find_vdb_flatfile() -> Tuple[int, Union[Path, None]]:
-    firstvdb = None
-    for proc in psutil.process_iter():
-        outputarg = 0
-        try:
-            if DEBUG >= 2: print(f'proc.cmdline={proc.cmdline()}')
-            for i, arg in enumerate(proc.cmdline()):
-                if arg.endswith('vdbench.jar'):
-                    firstvdb = proc
-                if arg == '-o':  # found the output option
-                    outputarg = i+1
-            if firstvdb:
-                break
-        except (psutil.NoSuchProcess, psutil.ZombieProcess):
-            pass   # Continue with next process
-
-    if firstvdb:
-        # workdir = Path(firstvdb.cwd())
-        if outputarg > 0 and outputarg < len(firstvdb.cmdline()):
-            workdir = Path(firstvdb.cmdline()[outputarg])
-            flatfile = workdir / 'flatfile.html'
-            if flatfile.is_file and flatfile.exists() and flatfile.stat().st_size > 0:
-                return firstvdb.pid, flatfile
-
-        return firstvdb.pid, None
-    return None, None
+def get_serialno_power() -> Tuple[str, str]:
+    cmd = f'{RAIDCOM} get system'.split()
+    if DEBUG:
+        print(f'cmd: {cmd}')
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if DEBUG:
+        print('stdout:', result.stdout)
+        print('stderr:', result.stderr)
+    for line in result.stdout.split('\n'):
+        if line.startswith('Serial'):
+            serialno = line.split()[-1]
+        if line.startswith('AVE(W)'):
+            watts = line.split()[-1]
+            break
+    return (serialno, watts)
 
 
-def vdb_alive(pid: int) -> bool:
-    try:
-        proc = psutil.Process(pid)
-        for arg in proc.cmdline():
-            if arg.endswith('vdbench.jar'):
-                return True
-    except (psutil.NoSuchProcess, psutil.ZombieProcess):
-        return False
-    return False
+def mpstat_monitor(mpulookup: Dict, interval: int) -> int:
+    hostname = os.environ.get('HITMP_EXPORTER_HOSTNAME', gethostname())
 
-
-def follow(fd: TextIO , timeout: int=60, pid: int=0):
-    '''generator function that yields new lines added to a file
-    '''
-    start = time.perf_counter()
-    while True:
-        line = fd.readline()
-        if not line:
-            if timeout and time.perf_counter() >= start+timeout:
-                print(f'\nWARNING: {timeout}sec timeout following: {fd.name}')
-                break
-            if pid and not vdb_alive(pid):
-                print(f'\nWARNING: Vdbench process no longer alive: {pid}')
-                break
-            time.sleep(0.25)
-            continue
-        yield line
-        start = time.perf_counter()
-
-
-def process_flatfile(pid: int, flatfile: str, labels: Optional[dict]=None):
-    labels['run'] = ''
-  
-    # Rather than using the default REGISTRY, use our own:
-    #    - Once destroyed will clear out prevous metrics.
     registry = CollectorRegistry()
     REGISTRY.register(registry)
-    header = None
-    with open(flatfile, 'r') as fd:
-        for line in follow(fd, 60):
-            line = line.strip()
-            if 'tod' in line:
-                header = line.split()
-                break
-        
-        if not header:
-            print(f'ERROR: Header not found in flatfile: {fd.name}')
-            return
 
-        header = [ x.lower().replace('/', '_').replace('%', '_pct') for x in header ]
-        print('Header:', header)
-        
-        gauges = { METRIC_PREFIX + k: Gauge(METRIC_PREFIX + k , '', labels.keys(), registry=registry) 
-                  for k in header[3:] }
-        if DEBUG:
-            print(gauges)
+    # gauges = dict()
+    # for key in HEADER_TRANSLATE:
+    #     gauges[key] = Gauge(METRIC_PREFIX + HEADER_TRANSLATE[key][0] , HEADER_TRANSLATE[key][1], labels.keys(), registry=registry) 
+    power_labels = { 'hostname': hostname, 'serialno': '????????', 'MPid': '???', 'MPU': '?????' }
+    power_gauge = Gauge(METRIC_PREFIX + 'power_watts', 'Storage Power usage (Watts)', power_labels.keys(), registry=registry)
+    elapsed_labels = { 'hostname': hostname, 'serialno': '????????', 'MPid': '???', 'MPU': '?????' }
+    elapsed_gauge = Gauge(METRIC_PREFIX + 'elapsed_total', 'Total elapsed time during the measurement (us)', elapsed_labels.keys(), registry=registry)
+    coretime_labels = { 'hostname': hostname, 'serialno': '????????', 'MPid': '000', 'MPU': '?????', 'mode': 'unknown' }
+    coretime_gauge = Gauge(METRIC_PREFIX + 'coretime_total', 'Core busy time over the elapsed period labeled by mode (us)', coretime_labels.keys(), registry=registry)
 
-        # fd.seek(0, os.SEEK_END)   # Go to end so we get the latest Summary Info
-        lastrun = ''
-        for line in follow(fd, 15, pid):
-            values = line.split()
-            if values[3].startswith('avg'):
-                continue
-            # logtime = values[1][:10] + ' ' + values[0]
-            # timestamp = datetime.strptime(logtime, DATETIME_FORMAT).timestamp()
-            run = values[2]
-            if run != lastrun:
-                print(f'\n{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} Scraping run: {run} ...')
-                for k in gauges:
-                    gauges[k].clear()
-                lastrun = run
-            labels['run'] = run
-            for i, val in enumerate(values[3:]):
-                metric = METRIC_PREFIX + header[i+3]
-                # gauges[metric]._timestamp = timestamp
-                if val == 'n/a':
-                    val = '0'
-                if DEBUG:
-                    print(metric, labels, val)
-                gauges[metric].labels(**labels).set(val)
-            if not DEBUG:
-                print('.', end='')
-        # Once complete unregister to avoid "Duplicate Metrics" errors:
-        REGISTRY.unregister(registry)
-
-
-def vdb_proc_monitor():
-    # Start the prometheus exporter web server:
-    start_http_server(EXPORTER_PORT)
-    toggle = True
+    # Gauge will scrape:
+    # raidcfg -a qry -o stat -pmp 0 8
+    # MP#   E-Time(us) B-Time(us)     OT(us)     OI(us)     OE(us)     MT(us)     ME(us)     BE(us)    Sys(us)
+    #   0   0x9aae6529 0xc1bd71d5 0xfcc8f3ab 0x00000000 0x00000000 0x00000000 0x00000000 0xae65ec34 0x168e91f6
+    #   1   0x9aa0c118 0x59190a80 0x55903954 0x00000000 0x00000000 0x00000000 0x00000000 0x9fa07938 0x63e857f4
+    #   2   0x9d10238a 0x0628bc93 0x4a0eb055 0x00000000 0x00000000 0x00000000 0x00000000 0x754d0c56 0x46ccffe8
+    #   3   0x9c24613b 0xdfb37f60 0xd9ebe538 0x00000000 0x00000000 0x00000000 0x00000000 0x6673303f 0x9f5469e9
+    #   4   0x98e3cb61 0x9d2b4afc 0xb5ce4a6d 0x00000000 0x00000000 0x00000000 0x00000000 0x6eca9bca 0x789264c5
+    #   5   0x97ef7c31 0xc8d8af15 0x5da53884 0x00000000 0x00000000 0x00000000 0x00000000 0x38e22b7e 0x32514b13
+    #   6   0x9aaf6fe4 0x4873beea 0xe7ca316d 0x00000000 0x00000000 0x00000000 0x00000000 0x7eac129f 0xe1fd7ade
+    #   7   0x99df5a0e 0xd8aca4d3 0x7a7565f9 0x00000000 0x00000000 0x00000000 0x00000000 0x44e10243 0x19563c97
 
     while True:
-        if toggle:
-            print('\nLooking for a Vdbench process with output option (-o).')
-            print('(Ensure the host /proc & Vdbench output directories are exposed to the docker container)')
-            print('Monitoring for Vdbench process ...')
-            toggle = not toggle
-        vdb_pid, vdb_flatfile = find_vdb_flatfile()
-        if vdb_pid and vdb_flatfile:
-            toggle = not toggle
-            hostname = os.environ.get('VDB_EXPORTER_HOSTNAME', gethostname())
-            labels = { 'hostname': hostname, 'resultdir': vdb_flatfile.parent.name }
-            print(f'Vdbench is active on PID: {vdb_pid} {labels}')
-            process_flatfile(vdb_pid, vdb_flatfile, labels)
+        start_timer = time.perf_counter()
 
-        time.sleep(0.25)
+        serialno, watts = get_serialno_power()
+        power_labels['serialno'] = serialno
+        power_gauge.labels(**power_labels).set(watts)
+
+        for mpbank in range(16):
+            cmd = f'{RAIDCFG} -a qry -o stat -pmp {mpbank} 8'.split()
+            if DEBUG:
+                print(f'cmd: {cmd}')
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if DEBUG > 1:
+                print('stdout:\n', result.stdout)
+                print('stderr:\n', result.stderr)
+
+            for line in result.stdout.split('\n'):
+                if line.startswith(HEADER_MATCH):
+                    headers = line.split()
+                elif line:
+                    cols = line.split()
+                    if cols[1] == '0x00000000':
+                        continue   # Skip if no elasped time, i.e. MP core does not exist
+
+                    if mpulookup:
+                        mpnum = int(cols[0])
+                        for i in mpulookup:
+                            if mpnum >= i:
+                                mpuname = mpulookup[i]
+                        elapsed_labels['MPU'] = mpuname
+                        coretime_labels['MPU'] = mpuname
+                    mpid = f'{int(cols[0]):03d}'
+                    elapsed_labels['MPid'] = mpid
+                    coretime_labels['MPid'] = mpid
+
+                    elapsed = float(int(cols[1], 16))
+                    if DEBUG > 2:
+                        print('ELAPSED:', elapsed_labels, elapsed)
+                    elapsed_gauge.labels(**elapsed_labels).set(elapsed)
+                    for i, header in enumerate(headers):
+                        if i < 2 or cols[i] == '0x00000000':
+                            continue
+                        coretime = float(int(cols[i], 16))
+                        coretime_labels['mode'] = HEADER_TRANSLATE[header]
+                        if DEBUG > 2:
+                            print('CORETIME:', header, coretime_labels, coretime)
+                        coretime_gauge.labels(**coretime_labels).set(coretime)
+            print('.', end='')
+        duration = time.perf_counter() - start_timer
+        if DEBUG:
+            print('Loop Execution time (secs):', duration )
+        time.sleep(max(0, interval-duration))
+
+    REGISTRY.unregister(registry)
+
+
+def check_raid_manager(rmdir: str):
+    global RAIDCFG, RAIDCOM
+
+    RAIDCFG = Path(rmdir) / 'usr/bin/raidcfg'
+    RAIDCOM = Path(rmdir) / 'usr/bin/raidcom'
+
+    if not RAIDCFG.is_file() or not os.access(RAIDCFG, os.X_OK) or \
+        not RAIDCOM.is_file() or not os.access(RAIDCOM, os.X_OK):
+        print('WARNING: Cannot find raidcfg or raidcom executables')
+    # TODO: Check HORCM operation is working.
+
 
 def cli():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -227,6 +225,13 @@ def cli():
         help='Increase verbose level, e.g. -vv = level 2.')
     parser.add_argument('-f', '--force', action='store_true',
          help='Force')
+    parser.add_argument('-r', '--rmdir', type=str, default=HITMP_RMLOCATION,
+         help='RAID Manager directory location ')
+    parser.add_argument('-i', '--interval', type=int, default=15,
+         help='Intervals between collection')
+    parser.add_argument('MPUnames', type=str, nargs='*',
+         help='Provide MPU to core mappings: <Name>:<starting-MP#> <Name>:<starting-MP#> ... (enables MPU labeling)')
+    
 
     args = parser.parse_args()
     global DEBUG, VERBOSE, FORCE
@@ -242,12 +247,30 @@ def cli():
 
     VERBOSE = args.verbose
 
+
+
+    mpudict = {}
+    for mpname in args.MPUnames:
+        name, mpid = mpname.split(':',1)
+        if not name or not mpid or not mpid.isdigit():
+            print(f'ERROR: Invalid MPU naming: {mpname}')
+            return 20
+        mpudict[int(mpid)] = name
+
+    if not mpudict:
+        print('WARNING: You have not supplied MPU name mappings: MPU labels will not be populated.')
+
     rc=0
+
+    # Disable default python metrics:
     REGISTRY.unregister(prometheus_client.GC_COLLECTOR)
     REGISTRY.unregister(prometheus_client.PLATFORM_COLLECTOR)
     REGISTRY.unregister(prometheus_client.PROCESS_COLLECTOR)
-    vdb_proc_monitor()
- 
+
+    rmdir = os.environ.get('HITMP_RMLOCATION', args.rmdir)
+    check_raid_manager(rmdir)
+    start_http_server(EXPORTER_PORT)
+    rc = mpstat_monitor(mpudict, args.interval)
     return rc          
 
 
